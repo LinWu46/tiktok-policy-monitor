@@ -1,6 +1,5 @@
-from google import genai
-from google.genai import types
-from config import GEMINI_API_KEY
+from groq import Groq
+from config import GROQ_API_KEY
 from core.diff_engine import DiffEngine
 
 QA_SYSTEM_PROMPT = """Bạn là trợ lý chuyên gia về chính sách TikTok Creator Rewards Program.
@@ -16,8 +15,7 @@ COUNTRY_NAMES = {
     "US": "🇺🇸 Mỹ"
 }
 
-client = genai.Client(api_key=GEMINI_API_KEY)
-
+client = Groq(api_key=GROQ_API_KEY)
 
 def build_policy_context():
     """Load policy content from state.json and build context string."""
@@ -38,9 +36,8 @@ def build_policy_context():
 
     return "\n\n".join(context_parts)
 
-
 def answer_question(user_question):
-    """Answer a user question about TikTok policies using Gemini + scraped data."""
+    """Answer a user question about TikTok policies using Groq + scraped data."""
     policy_context = build_policy_context()
 
     if not policy_context:
@@ -55,16 +52,16 @@ def answer_question(user_question):
 Câu hỏi của người dùng: {user_question}"""
 
     try:
-        response = client.models.generate_content(
-            model="gemini-1.5-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=QA_SYSTEM_PROMPT,
-                max_output_tokens=1000,
-                temperature=0.3
-            )
+        response = client.chat.completions.create(
+            model="llama3-70b-8192",
+            messages=[
+                {"role": "system", "content": QA_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=1000,
+            temperature=0.3
         )
-        return response.text.strip()
+        return response.choices[0].message.content.strip()
     except Exception as e:
         print(f"QA error: {e}")
         return f"❌ Lỗi khi trả lời: {e}"

@@ -1,5 +1,5 @@
 playwright>=1.44.0
-google-genai
+groq
 python-telegram-bot>=21.3
 python-dotenv==1.0.1
 apscheduler>=3.10.0
