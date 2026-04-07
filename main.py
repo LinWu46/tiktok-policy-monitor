@@ -35,9 +35,14 @@ async def _monitor_async():
 
         logger.info(f"🔔 Changes in {len(changes)} countries: {[c['country'] for c in changes]}")
 
-        for change in changes:
+        for i, change in enumerate(changes):
             country = change['country']
             logger.info(f"Processing {country}...")
+
+            # Delay between countries to avoid Gemini rate limits
+            if i > 0:
+                logger.info("⏳ Waiting 10s to avoid API rate limits...")
+                await asyncio.sleep(10)
 
             diff_summary = diff_engine.get_diff_summary(change['old_content'], change['new_content'])
             translation = translate(diff_summary)
