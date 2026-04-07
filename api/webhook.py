@@ -2,13 +2,13 @@
 Vercel Serverless Function — Telegram Webhook Handler.
 Handles incoming Telegram messages via webhook (no polling needed).
 Reads policy data from GitHub raw URL, answers Q&A via Groq API.
+Uses only urllib (built-in) for HTTP calls to avoid httpx SSL issues.
 """
 import json
 import os
+import urllib.request
+import urllib.parse
 from http.server import BaseHTTPRequestHandler
-
-import httpx
-from groq import Groq
 
 # ─── Config ──────────────────────────────────────────────────
 
@@ -31,6 +31,33 @@ Luôn ghi rõ nguồn (quốc gia nào: 🇩🇪 Đức, 🇫🇷 Pháp, 🇺�
 Dùng emoji phù hợp để dễ đọc."""
 
 
+# ─── HTTP helpers (using urllib, no external deps) ───────────
+
+def http_post_json(url, data):
+    """POST JSON data and return response dict."""
+    body = json.dumps(data).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=body,
+        headers={"Content-Type": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"HTTP POST error: {e}")
+        return None
+
+
+def http_get_json(url):
+    """GET JSON from URL."""
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"HTTP GET error: {e}")
+        return None
+
+
 # ─── Telegram API helpers ────────────────────────────────────
 
 def send_message(chat_id, text, parse_mode=None):
@@ -38,23 +65,16 @@ def send_message(chat_id, text, parse_mode=None):
     payload = {"chat_id": chat_id, "text": text}
     if parse_mode:
         payload["parse_mode"] = parse_mode
-    try:
-        httpx.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
-    except Exception as e:
-        print(f"Telegram send error: {e}")
+    result = http_post_json(f"{TELEGRAM_API}/sendMessage", payload)
+    if result and not result.get("ok"):
+        print(f"Telegram error: {result}")
 
 
 # ─── State & Q&A ─────────────────────────────────────────────
 
 def load_state_from_github():
     """Fetch state.json from GitHub raw content."""
-    try:
-        resp = httpx.get(GITHUB_STATE_URL, timeout=10)
-        if resp.status_code == 200:
-            return resp.json()
-    except Exception as e:
-        print(f"Failed to load state from GitHub: {e}")
-    return {}
+    return http_get_json(GITHUB_STATE_URL) or {}
 
 
 def build_policy_context(state):
@@ -72,7 +92,7 @@ def build_policy_context(state):
 
 
 def answer_question(question, state):
-    """Answer a question using Groq + policy data."""
+    """Answer a question using Groq API + policy data."""
     context = build_policy_context(state)
     if not context:
         return ("⚠️ Chưa có dữ liệu chính sách nào được thu thập.\n"
@@ -84,18 +104,30 @@ def answer_question(question, state):
 
 Câu hỏi của người dùng: {question}"""
 
+    # Call Groq API directly via HTTP (avoid SDK dependency issues)
+    groq_payload = {
+        "model": "llama-3.3-70b-versatile",
+        "messages": [
+            {"role": "system", "content": QA_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt}
+        ],
+        "max_tokens": 1000,
+        "temperature": 0.3
+    }
+
+    body = json.dumps(groq_payload).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.groq.com/openai/v1/chat/completions",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {GROQ_API_KEY}"
+        }
+    )
     try:
-        client = Groq(api_key=GROQ_API_KEY)
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": QA_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=1000,
-            temperature=0.3
-        )
-        return response.choices[0].message.content.strip()
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+            return result["choices"][0]["message"]["content"].strip()
     except Exception as e:
         print(f"Groq error: {e}")
         return f"❌ Lỗi khi trả lời: {e}"
@@ -144,7 +176,6 @@ def handle_question(chat_id, question):
     send_message(chat_id, "🤔 Đang tìm câu trả lời...")
     state = load_state_from_github()
     answer = answer_question(question, state)
-    # Telegram max message length is 4096
     if len(answer) > 4000:
         for i in range(0, len(answer), 4000):
             send_message(chat_id, answer[i:i+4000])
@@ -165,6 +196,8 @@ def process_update(update):
     if not chat_id or not text:
         return
 
+    print(f"Received: chat_id={chat_id}, text={text}")
+
     if text == "/start":
         handle_start(chat_id)
     elif text == "/status":
@@ -178,24 +211,36 @@ def process_update(update):
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
         """Handle webhook POST from Telegram."""
+        error_msg = None
         try:
             content_length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(content_length))
             process_update(body)
         except Exception as e:
+            error_msg = str(e)
             print(f"Webhook error: {e}")
 
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
-        self.wfile.write(b'{"ok": true}')
+        if error_msg:
+            self.wfile.write(json.dumps({"ok": False, "error": error_msg}).encode())
+        else:
+            self.wfile.write(b'{"ok": true}')
 
     def do_GET(self):
-        """Health check endpoint."""
+        """Health check + debug endpoint."""
+        has_token = bool(TELEGRAM_BOT_TOKEN)
+        has_groq = bool(GROQ_API_KEY)
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
         self.end_headers()
-        self.wfile.write(b"<h1>TikTok Policy Monitor Bot is running!</h1>")
+        html = f"""<h1>TikTok Policy Monitor Bot</h1>
+<p>Status: Running ✅</p>
+<p>TELEGRAM_BOT_TOKEN: {'✅ Set' if has_token else '❌ Missing'}</p>
+<p>GROQ_API_KEY: {'✅ Set' if has_groq else '❌ Missing'}</p>
+<p>Webhook URL: /api/webhook</p>"""
+        self.wfile.write(html.encode())
 
     def log_message(self, format, *args):
         """Suppress default logging."""
